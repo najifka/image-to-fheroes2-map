@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Image → FH2M Map</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      padding: 20px;
+    }
+    input, button {
+      margin: 10px 0;
+      padding: 8px;
+    }
+    canvas {
+      border: 1px solid #444;
+      margin-top: 10px;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+
+<h2>Image → fheroes2 map (*.fh2m)</h2>
+
+<input type="file" id="file" accept="image/*"><br>
+<button onclick="processImage()">Generate map</button>
+
+<br>
+<canvas id="canvas" width="144" height="144"></canvas>
+
+<script>
+/* --------------------------------------------------
+   Terrain palette
+-------------------------------------------------- */
+
+function buildTerrainPalette() {
+  const palette = []
+
+  const terrains = [
+    { base:[30,95,175], start:0, offset:16, count:4 },      // water
+    { base:[45,145,55], start:30, offset:38, count:8 },     // grass
+    { base:[235,235,245], start:92, offset:38, count:8 },   // snow
+    { base:[70,95,70], start:146, offset:38, count:8 },     // swamp
+    { base:[175,75,55], start:208, offset:38, count:8 },    // lava
+    { base:[215,185,90], start:262, offset:38, count:8 },   // desert
+    { base:[155,105,65], start:321, offset:16, count:8 },   // dirt
+    { base:[135,125,115], start:361, offset:38, count:8 },  // wasteland
+    { base:[235,225,185], start:415, offset:0, count:8 }    // beach
+  ]
+
+  for (const t of terrains) {
+    const minF = t.count <= 4 ? 0.85 : 0.75
+    const maxF = t.count <= 4 ? 1.15 : 1.25
+
+    for (let i = 0; i < t.count; i++) {
+      const f = minF + (maxF - minF) * (i / (t.count - 1))
+      palette.push({
+        index: t.start + t.offset + i,
+        r: Math.min(255, Math.round(t.base[0] * f)),
+        g: Math.min(255, Math.round(t.base[1] * f)),
+        b: Math.min(255, Math.round(t.base[2] * f))
+      })
+    }
+  }
+
+  return palette
+}
+
+const PALETTE = buildTerrainPalette()
+
+/* --------------------------------------------------
+   Utils
+-------------------------------------------------- */
+
+function pickMapSize(w, h) {
+  const m = Math.max(w, h)
+  if (m <= 36) return 36
+  if (m <= 72) return 72
+  if (m <= 108) return 108
+  return 144
+}
+
+function closestTerrain(r, g, b) {
+  let best = 0
+  let bestDist = 1e9
+
+  for (const t of PALETTE) {
+    const dr = r - t.r
+    const dg = g - t.g
+    const db = b - t.b
+    const d = dr*dr + dg*dg + db*db
+    if (d < bestDist) {
+      bestDist = d
+      best = t.index
+      if (d === 0) break
+    }
+  }
+  return best
+}
+
+/* --------------------------------------------------
+   Binary writer (big endian)
+-------------------------------------------------- */
+
+class BinWriter {
+  constructor() {
+    this.data = []
+  }
+  u8(v){ this.data.push(v & 255) }
+  u16(v){ this.u8(v>>8); this.u8(v) }
+  u32(v){ this.u8(v>>24); this.u8(v>>16); this.u8(v>>8); this.u8(v) }
+  str(s){
+    const b = new TextEncoder().encode(s)
+    this.u32(b.length)
+    this.data.push(...b)
+  }
+  bytes(){ return new Uint8Array(this.data) }
+}
+
+/* --------------------------------------------------
+   FH2M build
+-------------------------------------------------- */
+
+async function buildFH2M(tileIndices, size, name) {
+  const payload = new BinWriter()
+
+  payload.u32(0) // additionalInfo
+  payload.u32(tileIndices.length)
+
+  for (const t of tileIndices) {
+    payload.u16(t)
+    payload.u8(0)
+    payload.u32(0)
+  }
+
+  payload.u32(0) // events
+  payload.u32(0) // rumors
+
+  for (let i=0;i<9;i++) payload.u32(0)
+
+  const compressed = await compressZlib(payload.bytes())
+
+  const out = new BinWriter()
+
+  out.u8(0x68); out.u8(0x32); out.u8(0x6D)
+  out.u8(0x61); out.u8(0x70); out.u8(0)
+
+  out.u16(10)
+  out.u8(0)
+  out.u8(1)
+
+  out.u8(1); out.u8(1); out.u8(0)
+  out.u32(0)
+
+  out.u32(6)
+  out.u8(0x80); for(let i=0;i<5;i++) out.u8(0)
+
+  out.u8(0); out.u8(1); out.u8(1); out.u32(0)
+  out.u8(0); out.u32(0)
+
+  out.u32(size)
+  out.u8(0)
+
+  out.str(name)
+  out.str(`Generated from image (${size}x${size})`)
+  out.str("auto")
+
+  return new Blob([out.bytes(), compressed], {type:'application/octet-stream'})
+}
+
+/* --------------------------------------------------
+   zlib via CompressionStream
+-------------------------------------------------- */
+
+async function compressZlib(data) {
+  const cs = new CompressionStream('deflate')
+  const writer = cs.writable.getWriter()
+  writer.write(data)
+  writer.close()
+  const buf = await new Response(cs.readable).arrayBuffer()
+  return new Uint8Array(buf)
+}
+
+/* --------------------------------------------------
+   Main
+-------------------------------------------------- */
+
+async function processImage() {
+  const file = document.getElementById('file').files[0]
+  if (!file) return
+
+  const img = new Image()
+  img.src = URL.createObjectURL(file)
+  await img.decode()
+
+  const size = pickMapSize(img.width, img.height)
+  const canvas = document.getElementById('canvas')
+  canvas.width = canvas.height = size
+  const ctx = canvas.getContext('2d')
+
+  const s = Math.min(img.width, img.height)
+  ctx.drawImage(
+    img,
+    (img.width - s)/2,
+    (img.height - s)/2,
+    s, s,
+    0, 0,
+    size, size
+  )
+
+  const imgData = ctx.getImageData(0,0,size,size).data
+  const tiles = []
+
+  for (let i=0;i<imgData.length;i+=4) {
+    let r = imgData[i]
+    let g = imgData[i+1]
+    let b = imgData[i+2]
+    let a = imgData[i+3]
+
+    if (a !== 255) {
+      r = (r*a + 255*(255-a))/255
+      g = (g*a + 255*(255-a))/255
+      b = (b*a + 255*(255-a))/255
+    }
+
+    tiles.push(closestTerrain(r,g,b))
+  }
+
+  const blob = await buildFH2M(tiles, size, file.name.replace(/\..+$/, ''))
+
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = file.name.replace(/\..+$/, '.fh2m')
+  a.click()
+}
+</script>
+</body>
+</html>
